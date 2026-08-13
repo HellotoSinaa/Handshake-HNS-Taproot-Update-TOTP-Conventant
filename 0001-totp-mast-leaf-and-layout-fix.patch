@@ -1,0 +1,962 @@
+From 2fc661dc53a62562c0baf1f8f30f4003c0af0620 Mon Sep 17 00:00:00 2001
+From: NIHON <nihon@learnhns.com>
+Date: Thu, 13 Aug 2026 17:51:54 +0000
+Subject: [PATCH] Add TOTP-gated MAST recovery leaf; fix src/tests/examples
+ layout
+
+- New totp.py: per-time-step Schnorr keypairs (HMAC-derived) as MAST
+  leaves, so a live authenticator code becomes a signature-bound
+  script-path condition instead of a bare, replayable code.
+- hns_covenant.py: NameOutputSpec now accepts totp=TotpLeafSet(...)
+  alongside recovery_leaves; leaves get merged into one tree.
+- docs/ARCHITECTURE.md: new section on time-sync window tradeoffs,
+  TOTP secret management, and why a ZK proof is the real end state
+  for this leaf (with the leaf-per-step version usable today without
+  it, since it's plain Schnorr + MAST, same as everything else here).
+- Fixed repo layout: moved implementation into src/hns_taproot/,
+  tests into tests/, demo into examples/ -- setup.py and the existing
+  test files already assumed this layout (sys.path insert of 'src',
+  'pytest tests/', 'python examples/...' in README) but the published
+  repo had everything flat at root, so tests/install didn't actually
+  work. Fixed to match what was already documented.
+- New examples/demo_totp_recovery.py and tests/test_totp.py (12 new
+  tests). Full suite: 22 passed.
+---
+ ARCHITECTURE.md                               |  63 -------
+ README.md                                     |  28 ++-
+ docs/ARCHITECTURE.md                          | 145 +++++++++++++++
+ .../demo_name_transfer_taproot.py             |   0
+ examples/demo_totp_recovery.py                |  86 +++++++++
+ setup.py                                      |   4 +-
+ __init__.py => src/hns_taproot/__init__.py    |  18 +-
+ address.py => src/hns_taproot/address.py      |   0
+ .../hns_taproot/hns_covenant.py               |  43 ++++-
+ mast.py => src/hns_taproot/mast.py            |   0
+ schnorr.py => src/hns_taproot/schnorr.py      |   0
+ secp256k1.py => src/hns_taproot/secp256k1.py  |   0
+ taproot.py => src/hns_taproot/taproot.py      |   0
+ src/hns_taproot/totp.py                       | 173 ++++++++++++++++++
+ test_mast.py => tests/test_mast.py            |   0
+ test_schnorr.py => tests/test_schnorr.py      |   0
+ test_taproot.py => tests/test_taproot.py      |   0
+ tests/test_totp.py                            | 134 ++++++++++++++
+ 18 files changed, 621 insertions(+), 73 deletions(-)
+ delete mode 100644 ARCHITECTURE.md
+ create mode 100644 docs/ARCHITECTURE.md
+ rename demo_name_transfer_taproot.py => examples/demo_name_transfer_taproot.py (100%)
+ create mode 100644 examples/demo_totp_recovery.py
+ rename __init__.py => src/hns_taproot/__init__.py (75%)
+ rename address.py => src/hns_taproot/address.py (100%)
+ rename hns_covenant.py => src/hns_taproot/hns_covenant.py (67%)
+ rename mast.py => src/hns_taproot/mast.py (100%)
+ rename schnorr.py => src/hns_taproot/schnorr.py (100%)
+ rename secp256k1.py => src/hns_taproot/secp256k1.py (100%)
+ rename taproot.py => src/hns_taproot/taproot.py (100%)
+ create mode 100644 src/hns_taproot/totp.py
+ rename test_mast.py => tests/test_mast.py (100%)
+ rename test_schnorr.py => tests/test_schnorr.py (100%)
+ rename test_taproot.py => tests/test_taproot.py (100%)
+ create mode 100644 tests/test_totp.py
+
+diff --git a/ARCHITECTURE.md b/ARCHITECTURE.md
+deleted file mode 100644
+index fd08869..0000000
+--- a/ARCHITECTURE.md
++++ /dev/null
+@@ -1,63 +0,0 @@
+-# Architecture
+-
+-## Why look at Taproot for HNS at all
+-
+-Bitcoin's Taproot upgrade (BIP340/341/342) solved a specific problem: most
+-spends are the "boring" cooperative case (single signer, or a cooperative
+-multisig collapsed via MuSig), but a UTXO's script often has to account for
+-uncommon cases too (timelocked recovery, multisig fallback, escrow). Before
+-Taproot, every one of those conditions had to be visible in the scriptPubKey
+-or witness, whether or not it was ever used — a privacy leak and a fee cost.
+-Taproot's fix: commit to *all* the conditions in a Merkle tree, but only
+-reveal the branch actually used. The common case (key path) reveals nothing
+-extra at all — it looks like a single-sig spend no matter how complex the
+-underlying policy is.
+-
+-HNS name ownership has the same shape. A name's controlling output changes
+-hands via routine covenant transitions (`TRANSFER` → `FINALIZE`, `UPDATE`,
+-`RENEW`) that ideally look identical on-chain and cost the minimum, but an
+-owner may reasonably want:
+-
+-- a **timelocked fallback** claim path (e.g. "if this key is inactive for
+-  90 days, a backup key can reclaim the name"),
+-- a **registrar- or guardian-cosigned recovery** path for lost-key scenarios,
+-  without giving that cosigner day-to-day control,
+-- an **emergency revoke** path distinct from the owner's normal key.
+-
+-Today, doing any of this on HNS means either not doing it, or building it
+-as an out-of-band custody arrangement that isn't enforced by the chain at
+-all. A MAST-wrapped output makes those conditions chain-enforced *and*
+-invisible until invoked.
+-
+-## What this repo implements vs. what a real deployment needs
+-
+-| Piece | Status here | What's needed for real deployment |
+-|---|---|---|
+-| Schnorr sign/verify (BIP340) | Implemented, tested | Same math; hsd/consensus would need script-interpreter support for a new sighash + verification opcode |
+-| MAST tree + control blocks | Implemented, tested | Same construction; needs a canonical serialization matching whatever HNS opcodes encode leaf scripts |
+-| Key tweaking (BIP341-style) | Implemented, tested | Same; the open design question is whether HNS wants BIP341's exact tweak formula or a variant tied to covenant type |
+-| Witness-v1 address encoding | Implemented (Bech32m) | HNS would need to reserve a witness version + update hsd's address parser |
+-| Recovery leaf scripts (`simple_timelock_script`, `multisig_recovery_script`) | Placeholder byte encodings | Real hsd opcode sequences (CSV-equivalent, multisig `CHECKMULTISIG`-equivalent) once/if consensus support exists |
+-| Covenant transition enforcement | Not touched | This repo only wraps the *output key*; covenant validity (is this actually a legal TRANSFER given the current name state) stays exactly as hsd already enforces it — this is additive, not a replacement |
+-
+-## Open questions for anyone taking this further
+-
+-1. **Soft fork vs. sidechain vs. off-chain custody layer.** Changing hsd's
+-   consensus rules to recognize a new witness version is a real soft fork;
+-   worth weighing against building this as a custody convention on top of
+-   existing multisig-style covenant scripts instead.
+-2. **Sighash design.** BIP341 introduced a new sighash algorithm alongside
+-   Schnorr. HNS's existing sighash would need review for whether it already
+-   composes safely with Schnorr signing or needs its own update.
+-3. **Fee/weight accounting.** Part of Taproot's appeal on Bitcoin is
+-   witness discount weighting. HNS's fee model would need an equivalent
+-   story for this to actually be cheaper than the status quo, not just more
+-   private.
+-4. **Leaf script language.** This repo's placeholder leaf scripts
+-   (`CSV`-prefixed timelock, `MULTI`-prefixed multisig) are stand-ins. A
+-   real proposal needs actual opcode sequences hsd's script interpreter
+-   can execute.
+-
+-None of this is a promise that HNS will or should adopt Taproot — it's a
+-working sketch of what the primitives look like if it did, so the trade-offs
+-above can be discussed concretely instead of abstractly.
+diff --git a/README.md b/README.md
+index 9b449d1..429b6fe 100644
+--- a/README.md
++++ b/README.md
+@@ -21,18 +21,27 @@ Companion code for the write-up on [learnhns.com](https://learnhns.com).
+ - **`hns_covenant.py`** — models HNS's covenant types (OPEN, BID, REVEAL,
+   REGISTER, TRANSFER, FINALIZE, etc., matching hsd's `covenant.types`) and
+   wraps a name's controlling output in a Taproot-style key, with optional
+-  hidden recovery leaves (timelocked fallback claim, multisig recovery, ...).
++  hidden recovery leaves (timelocked fallback claim, multisig recovery,
++  TOTP-gated recovery, ...).
++- **`totp.py`** — a TOTP-gated (RFC 6238-style) recovery leaf: each time
++  step gets its own deterministically-derived Schnorr keypair, so "prove
++  you have the live authenticator code" becomes an ordinary script-path
++  MAST leaf instead of a bare, replayable 6-digit code. See the module
++  docstring for the time-sync and secret-management tradeoffs, and why
++  a ZK proof (not implemented here) is the strictly-stronger version of
++  this same idea.
+ - **`secp256k1.py`** — the underlying pure-Python field/curve arithmetic
+   everything else is built on.
+ 
+ All the cryptographic building blocks (Schnorr signing/verification, MAST
+-tree hashing, key tweaking) are fully functional and covered by tests. Run
+-them yourself, don't take it on faith:
++tree hashing, key tweaking, TOTP leaf derivation) are fully functional and
++covered by tests. Run them yourself, don't take it on faith:
+ 
+ ```bash
+ pip install -r requirements.txt
+ pytest tests/ -v
+ python examples/demo_name_transfer_taproot.py
++python examples/demo_totp_recovery.py
+ ```
+ 
+ ## Scope — please read before assuming this is "live"
+@@ -53,8 +62,10 @@ rather than coin ownership.
+ 
+ If you want to take this further (actually proposing a soft fork, wiring
+ real hsd script opcodes into the recovery leaves instead of the placeholder
+-encodings in `hns_covenant.py`), see `docs/ARCHITECTURE.md` for the open
+-questions.
++encodings in `hns_covenant.py`), see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
++for the open questions, including where the TOTP leaf's time-sync and
++secret-management tradeoffs fit and why a ZK-proof version is the real
++end state for that particular leaf.
+ 
+ ## Install
+ 
+@@ -68,8 +79,10 @@ pip install -e .
+ ```python
+ from hns_taproot import schnorr
+ from hns_taproot.hns_covenant import CovenantType, NameOutputSpec, RecoveryLeaf, simple_timelock_script
++from hns_taproot.totp import TotpLeafSet
+ 
+ owner_priv = schnorr.generate_privkey()
++totp_secret = schnorr.generate_privkey()  # provisioned once, handled like any TOTP seed
+ 
+ spec = NameOutputSpec(
+     name="learnhns",
+@@ -78,11 +91,16 @@ spec = NameOutputSpec(
+     recovery_leaves=[
+         RecoveryLeaf(label="90-day timelock fallback", script=simple_timelock_script(12960)),
+     ],
++    totp=TotpLeafSet(secret=totp_secret, step_seconds=30, window=1),
+ )
+ output = spec.build()
+ print(output.summary())
+ ```
+ 
++See [`examples/demo_totp_recovery.py`](examples/demo_totp_recovery.py) for
++the full flow: building the tree, deriving the current step's key, signing,
++and revealing just that one leaf via a control block.
++
+ ## Security note
+ 
+ The curve arithmetic in `secp256k1.py` is written for clarity and is **not
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+new file mode 100644
+index 0000000..04dc374
+--- /dev/null
++++ b/docs/ARCHITECTURE.md
+@@ -0,0 +1,145 @@
++# Architecture
++
++## Why look at Taproot for HNS at all
++
++Bitcoin's Taproot upgrade (BIP340/341/342) solved a specific problem: most
++spends are the "boring" cooperative case (single signer, or a cooperative
++multisig collapsed via MuSig), but a UTXO's script often has to account for
++uncommon cases too (timelocked recovery, multisig fallback, escrow). Before
++Taproot, every one of those conditions had to be visible in the scriptPubKey
++or witness, whether or not it was ever used — a privacy leak and a fee cost.
++Taproot's fix: commit to *all* the conditions in a Merkle tree, but only
++reveal the branch actually used. The common case (key path) reveals nothing
++extra at all — it looks like a single-sig spend no matter how complex the
++underlying policy is.
++
++HNS name ownership has the same shape. A name's controlling output changes
++hands via routine covenant transitions (`TRANSFER` → `FINALIZE`, `UPDATE`,
++`RENEW`) that ideally look identical on-chain and cost the minimum, but an
++owner may reasonably want:
++
++- a **timelocked fallback** claim path (e.g. "if this key is inactive for
++  90 days, a backup key can reclaim the name"),
++- a **registrar- or guardian-cosigned recovery** path for lost-key scenarios,
++  without giving that cosigner day-to-day control,
++- an **emergency revoke** path distinct from the owner's normal key.
++
++Today, doing any of this on HNS means either not doing it, or building it
++as an out-of-band custody arrangement that isn't enforced by the chain at
++all. A MAST-wrapped output makes those conditions chain-enforced *and*
++invisible until invoked.
++
++## What this repo implements vs. what a real deployment needs
++
++| Piece | Status here | What's needed for real deployment |
++|---|---|---|
++| Schnorr sign/verify (BIP340) | Implemented, tested | Same math; hsd/consensus would need script-interpreter support for a new sighash + verification opcode |
++| MAST tree + control blocks | Implemented, tested | Same construction; needs a canonical serialization matching whatever HNS opcodes encode leaf scripts |
++| Key tweaking (BIP341-style) | Implemented, tested | Same; the open design question is whether HNS wants BIP341's exact tweak formula or a variant tied to covenant type |
++| Witness-v1 address encoding | Implemented (Bech32m) | HNS would need to reserve a witness version + update hsd's address parser |
++| Recovery leaf scripts (`simple_timelock_script`, `multisig_recovery_script`, `totp_leaf_script`) | Placeholder byte encodings | Real hsd opcode sequences (CSV-equivalent, multisig `CHECKMULTISIG`-equivalent, Schnorr `CHECKSIG`-equivalent for the TOTP step key) once/if consensus support exists |
++| Covenant transition enforcement | Not touched | This repo only wraps the *output key*; covenant validity (is this actually a legal TRANSFER given the current name state) stays exactly as hsd already enforces it — this is additive, not a replacement |
++
++## TOTP as a MAST leaf: an alternative recovery path
++
++Alongside the timelock and multisig recovery leaves, a MAST tree leaf can
++require proof of a live TOTP (RFC 6238) code — the same primitive behind
++any authenticator app — instead of a static recovery key. `totp.py`
++implements this the same way this repo implements everything else: real
++math, not a stub. The construction, in short:
++
++- Derive a fresh Schnorr keypair per time step:
++  `privkey_t = HMAC-SHA256(secret, "HNS-TOTP-LEAF" || step_counter) mod n`.
++- Bake each step's `pubkey_t` into its own leaf (`totp_leaf_script`) for a
++  window of steps around "now" (`TotpLeafSet`), so the tree tolerates
++  realistic clock drift.
++- At spend time, the owner signs with the current step's key and reveals
++  only that one leaf — exactly like revealing a timelock or multisig
++  branch. Every other step and every other leaf stays hidden in the root.
++
++This is deliberately *not* "check a 6-digit code in script." A bare code
++would be the witness itself — replayable by anyone who observes it before
++confirmation, and not bound to a specific spending transaction. Requiring
++a signature over the transaction fixes both problems while keeping the
++same "prove you hold the live TOTP secret" property.
++
++### Time synchronization
++
++The tree has to commit to a *window* of steps, not just the single step
++valid "right now," because the signer's clock, the relaying node, and
++confirmation time are never perfectly aligned. `TotpLeafSet.window`
++controls that tolerance (default ±1 step, i.e. ~90 seconds at the default
++30-second step). This is a real tradeoff, not a default to leave alone:
++
++- **Too narrow** — a legitimate spend can get rejected for landing one
++  step late, especially if there's any mempool delay between signing and
++  confirmation.
++- **Too wide** — every extra step is an extra pre-committed leaf, meaning
++  more of the tree's shape is fixed in advance and more valid signing
++  keys exist concurrently, which widens (slightly) the practical window
++  during which a leaked step-key remains useful.
++
++Pick the window based on the actual expected clock drift and confirmation
++delay for the deployment, not by copying the default.
++
++### Secret management
++
++The TOTP `secret` plays the same role as any authenticator app's seed:
++whoever holds it can derive every past and future step's private key. It
++needs the handling any TOTP seed needs — secure enclave / HSM storage,
++never logged, rotated on suspected compromise — *plus* the awareness that
++compromise here isn't "someone can log into an account," it's "someone
++can reconstruct a name-ownership recovery path." Provisioning (how the
++secret reaches the owner's authenticator app in the first place) is a real
++part of the design, not an afterthought — treat the enrollment flow with
++the same care as generating `owner_privkey`.
++
++### Why ZK proofs are the real fix, and why this still works without them
++
++The leaf-per-step construction still leaks metadata at spend time: an
++observer watching the mempool learns "this owner's TOTP path fired just
++now," even though they learn nothing about the secret or the unused
++leaves. A zero-knowledge proof of *"I know a secret and a step such that
++HMAC(secret, step) derives a key that signs this transaction, and step is
++within the current window"* would hide even that — the witness becomes a
++proof rather than a distinguishable pubkey/signature pair, so a TOTP-gated
++spend would be indistinguishable from any other script-path (or key-path)
++spend. That's a strictly stronger privacy and anti-replay property than
++what's implemented here, and it's the right long-term target if HNS ever
++gets a proving system in its script interpreter.
++
++It is not, however, a precondition for using this pattern today. The
++leaf-per-step version is pure Schnorr + MAST — it composes with
++`NameOutputSpec` exactly like the timelock and multisig leaves already do,
++and needs nothing from hsd beyond what the rest of this repo already
++assumes (see the primitives table above). ZK is the upgrade path; the
++covenant-compatible version ships now.
++
++## Open questions for anyone taking this further
++
++1. **Soft fork vs. sidechain vs. off-chain custody layer.** Changing hsd's
++   consensus rules to recognize a new witness version is a real soft fork;
++   worth weighing against building this as a custody convention on top of
++   existing multisig-style covenant scripts instead.
++2. **Sighash design.** BIP341 introduced a new sighash algorithm alongside
++   Schnorr. HNS's existing sighash would need review for whether it already
++   composes safely with Schnorr signing or needs its own update.
++3. **Fee/weight accounting.** Part of Taproot's appeal on Bitcoin is
++   witness discount weighting. HNS's fee model would need an equivalent
++   story for this to actually be cheaper than the status quo, not just more
++   private.
++4. **Leaf script language.** This repo's placeholder leaf scripts
++   (`CSV`-prefixed timelock, `MULTI`-prefixed multisig, `TOTP`-prefixed
++   step-key check) are stand-ins. A real proposal needs actual opcode
++   sequences hsd's script interpreter can execute.
++5. **ZK upgrade path for the TOTP leaf.** The leaf-per-step TOTP
++   construction reveals which step fired at spend time. Replacing it with
++   a zero-knowledge proof of "I know a secret and current step" would hide
++   that too, but needs a circuit and a proving system HNS's script
++   interpreter doesn't have today — worth scoping alongside whatever
++   general-purpose script upgrade eventually lands, rather than as a
++   TOTP-specific special case.
++
++None of this is a promise that HNS will or should adopt Taproot — it's a
++working sketch of what the primitives look like if it did, so the trade-offs
++above can be discussed concretely instead of abstractly.
+diff --git a/demo_name_transfer_taproot.py b/examples/demo_name_transfer_taproot.py
+similarity index 100%
+rename from demo_name_transfer_taproot.py
+rename to examples/demo_name_transfer_taproot.py
+diff --git a/examples/demo_totp_recovery.py b/examples/demo_totp_recovery.py
+new file mode 100644
+index 0000000..e19a08f
+--- /dev/null
++++ b/examples/demo_totp_recovery.py
+@@ -0,0 +1,86 @@
++"""
++Demo: wrap a `learnhns.com` name's TRANSFER output behind a Taproot-style
++key with two hidden recovery paths -- a 90-day timelock fallback and a
++TOTP-gated leaf -- then walk through spending via the TOTP path.
++
++Run with:  python examples/demo_totp_recovery.py
++"""
++import hashlib
++import sys
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
++
++from hns_taproot import schnorr
++from hns_taproot.hns_covenant import CovenantType, NameOutputSpec, RecoveryLeaf, simple_timelock_script
++from hns_taproot.taproot import build_control_block
++from hns_taproot.totp import TotpLeafSet, hotp_code, totp_counter
++
++
++def main():
++    owner_priv = schnorr.generate_privkey()
++
++    # In practice this is provisioned once, shown to the owner as a QR
++    # code (same enrollment flow as any authenticator app), and then
++    # stored the way any TOTP seed / key material should be -- see the
++    # "Secret management" section of totp.py's module docstring.
++    totp_secret = schnorr.generate_privkey()  # 32 random bytes stands in for a TOTP seed
++    totp = TotpLeafSet(secret=totp_secret, step_seconds=30, window=1)
++
++    spec = NameOutputSpec(
++        name="learnhns",
++        covenant=CovenantType.TRANSFER,
++        owner_privkey=owner_priv,
++        recovery_leaves=[
++            RecoveryLeaf(
++                label="90-day timelock fallback claim",
++                script=simple_timelock_script(blocks=12960),
++            ),
++        ],
++        totp=totp,
++    )
++    output = spec.build()
++
++    print("=== Taproot-wrapped HNS name output (timelock leaf + TOTP window) ===")
++    print(output.summary())
++    print()
++
++    # --- What the owner's authenticator app would show right now ---
++    now_counter = totp_counter(totp.step_seconds)
++    print("=== Authenticator app view (for comparison only, not used on-chain) ===")
++    print(f"current 6-digit code: {hotp_code(totp_secret, now_counter)}")
++    print(
++        "The on-chain leaf doesn't check this code directly -- it checks a "
++        "signature from the Schnorr key deterministically derived from the "
++        "same (secret, time-step) pair. See totp.py for why."
++    )
++    print()
++
++    # --- Script-path spend via the TOTP leaf ---
++    msg = hashlib.sha256(b"spend: name=learnhns covenant=FINALIZE via totp-recovery").digest()
++    counter, sig = totp.sign_for_now(msg)
++    leaf_index = output.totp_leaf_index_for_counter(counter)
++
++    control_block = build_control_block(
++        internal_pubkey_x=output.taproot.internal_pubkey,
++        tree=output.tree,
++        leaf_index=leaf_index,
++        output_parity_even=output.taproot.output_parity_even,
++    )
++
++    print("=== Script-path spend (TOTP leaf revealed) ===")
++    print(f"time step counter:    {counter}")
++    print(f"revealed leaf script: {output.tree.leaves[leaf_index].script.hex()}")
++    print(f"signature valid:      {totp.verify_for_counter(msg, counter, sig)}")
++    print(f"control block ({len(control_block)} bytes): {control_block.hex()}")
++    print()
++    print(
++        "Only this one time-step leaf and its sibling hashes are revealed. "
++        "The timelock leaf, and every other step in the TOTP window, stay "
++        "hidden inside the merkle root -- exactly like an unused branch in "
++        "any other MAST tree."
++    )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/setup.py b/setup.py
+index 104108e..d99dd14 100644
+--- a/setup.py
++++ b/setup.py
+@@ -2,8 +2,8 @@ from setuptools import find_packages, setup
+ 
+ setup(
+     name="hns-taproot",
+-    version="0.1.0",
+-    description="Taproot-style (BIP340/341 pattern) key- and script-path spending for Handshake (HNS) name outputs",
++    version="0.2.0",
++    description="Taproot-style (BIP340/341 pattern) key- and script-path spending for Handshake (HNS) name outputs, with a TOTP-gated MAST recovery leaf",
+     long_description=open("README.md", encoding="utf-8").read(),
+     long_description_content_type="text/markdown",
+     author="NIHON",
+diff --git a/__init__.py b/src/hns_taproot/__init__.py
+similarity index 75%
+rename from __init__.py
+rename to src/hns_taproot/__init__.py
+index eaa3651..e0cbf59 100644
+--- a/__init__.py
++++ b/src/hns_taproot/__init__.py
+@@ -14,9 +14,18 @@ from .hns_covenant import (
+     TaprootNameOutput,
+     simple_timelock_script,
+     multisig_recovery_script,
++    totp_recovery_leaves,
++)
++from .totp import (
++    TotpLeafSet,
++    hotp_code,
++    totp_counter,
++    derive_step_privkey,
++    derive_step_pubkey,
++    totp_leaf_script,
+ )
+ 
+-__version__ = "0.1.0"
++__version__ = "0.2.0"
+ 
+ __all__ = [
+     "generate_privkey",
+@@ -38,4 +47,11 @@ __all__ = [
+     "TaprootNameOutput",
+     "simple_timelock_script",
+     "multisig_recovery_script",
++    "totp_recovery_leaves",
++    "TotpLeafSet",
++    "hotp_code",
++    "totp_counter",
++    "derive_step_privkey",
++    "derive_step_pubkey",
++    "totp_leaf_script",
+ ]
+diff --git a/address.py b/src/hns_taproot/address.py
+similarity index 100%
+rename from address.py
+rename to src/hns_taproot/address.py
+diff --git a/hns_covenant.py b/src/hns_taproot/hns_covenant.py
+similarity index 67%
+rename from hns_covenant.py
+rename to src/hns_taproot/hns_covenant.py
+index 9248cae..d2ad8fd 100644
+--- a/hns_covenant.py
++++ b/src/hns_taproot/hns_covenant.py
+@@ -34,6 +34,7 @@ from .address import taproot_address, HRP_MAINNET
+ from .mast import TapTree
+ from .schnorr import pubkey_from_privkey
+ from .taproot import TaprootOutput, tweak_pubkey
++from .totp import DEFAULT_STEP_SECONDS, DEFAULT_WINDOW, TotpLeafSet
+ 
+ 
+ class CovenantType(IntEnum):
+@@ -67,17 +68,25 @@ class NameOutputSpec:
+     covenant: CovenantType
+     owner_privkey: bytes
+     recovery_leaves: list[RecoveryLeaf] = field(default_factory=list)
++    totp: TotpLeafSet | None = None
++    totp_at: int | None = None  # fixed timestamp for reproducible builds/tests; None = "now"
+     hrp: str = HRP_MAINNET
+ 
+     def build(self) -> "TaprootNameOutput":
+         internal_pub = pubkey_from_privkey(self.owner_privkey)
++        all_leaves = list(self.recovery_leaves)
++        totp_leaf_offset = len(all_leaves)
++        if self.totp is not None:
++            all_leaves.extend(totp_recovery_leaves(self.totp, at=self.totp_at))
++
+         tree = None
+         root = None
+-        if self.recovery_leaves:
++        if all_leaves:
+             tree = TapTree()
+-            for leaf in self.recovery_leaves:
++            for leaf in all_leaves:
+                 tree.add_leaf(leaf.script)
+             root = tree.merkle_root()
++
+         tro = tweak_pubkey(internal_pub, root)
+         address = taproot_address(tro.output_pubkey, hrp=self.hrp)
+         return TaprootNameOutput(
+@@ -86,6 +95,8 @@ class NameOutputSpec:
+             taproot=tro,
+             tree=tree,
+             address=address,
++            totp=self.totp,
++            totp_leaf_offset=totp_leaf_offset if self.totp is not None else None,
+         )
+ 
+ 
+@@ -96,10 +107,19 @@ class TaprootNameOutput:
+     taproot: TaprootOutput
+     tree: TapTree | None
+     address: str
++    totp: TotpLeafSet | None = None
++    totp_leaf_offset: int | None = None
+ 
+     def has_recovery_paths(self) -> bool:
+         return self.tree is not None and len(self.tree.leaves) > 0
+ 
++    def totp_leaf_index_for_counter(self, counter: int, at: int | None = None) -> int:
++        """Index into `self.tree.leaves` for a given TOTP step counter,
++        for building that leaf's control-block/inclusion proof."""
++        if self.totp is None or self.totp_leaf_offset is None:
++            raise ValueError("this output has no TOTP leaves")
++        return self.totp_leaf_offset + self.totp.leaf_index_for_counter(counter, at=at)
++
+     def summary(self) -> str:
+         lines = [
+             f"name:            {self.name}",
+@@ -113,6 +133,12 @@ class TaprootNameOutput:
+             lines.append(f"recovery leaves: {len(self.tree.leaves)}")
+         else:
+             lines.append("recovery leaves: none (key-path only)")
++        if self.totp is not None:
++            lines.append(
++                f"totp leaves:     {2 * self.totp.window + 1} "
++                f"(+/-{self.totp.window} step(s) of {self.totp.step_seconds}s, "
++                f"~{self.totp.step_seconds * (2 * self.totp.window + 1)}s tolerance window)"
++            )
+         return "\n".join(lines)
+ 
+ 
+@@ -127,3 +153,16 @@ def multisig_recovery_script(pubkeys_x: list[bytes], threshold: int) -> bytes:
+     """Placeholder encoding for an m-of-n Schnorr recovery condition."""
+     header = bytes([threshold, len(pubkeys_x)])
+     return b"MULTI" + header + b"".join(pubkeys_x)
++
++
++def totp_recovery_leaves(totp: TotpLeafSet, at: int | None = None) -> list[RecoveryLeaf]:
++    """One `RecoveryLeaf` per time step in `totp`'s tolerance window, so
++    a TOTP-gated recovery path can sit alongside timelock/multisig
++    leaves in the same tree. See `totp.py` for the derivation, the time-
++    sync/secret-management caveats, and why this is the covenant-
++    compatible fallback to a full ZK construction rather than a
++    substitute for one."""
++    return [
++        RecoveryLeaf(label=f"totp step {counter}", script=script)
++        for counter, script in zip(totp.counters(at=at), totp.scripts(at=at))
++    ]
+diff --git a/mast.py b/src/hns_taproot/mast.py
+similarity index 100%
+rename from mast.py
+rename to src/hns_taproot/mast.py
+diff --git a/schnorr.py b/src/hns_taproot/schnorr.py
+similarity index 100%
+rename from schnorr.py
+rename to src/hns_taproot/schnorr.py
+diff --git a/secp256k1.py b/src/hns_taproot/secp256k1.py
+similarity index 100%
+rename from secp256k1.py
+rename to src/hns_taproot/secp256k1.py
+diff --git a/taproot.py b/src/hns_taproot/taproot.py
+similarity index 100%
+rename from taproot.py
+rename to src/hns_taproot/taproot.py
+diff --git a/src/hns_taproot/totp.py b/src/hns_taproot/totp.py
+new file mode 100644
+index 0000000..dcd80a3
+--- /dev/null
++++ b/src/hns_taproot/totp.py
+@@ -0,0 +1,173 @@
++"""
++TOTP-gated recovery leaf for the MAST tree.
++
++Idea
++----
++Alongside the timelock and multisig recovery leaves already in
++`hns_covenant.py`, one leaf of the tree can require proof of a live
++TOTP (RFC 6238) code instead of (or in addition to) a static recovery
++key. This turns "I have my authenticator app" into a script-path
++condition that stays hidden -- like every other leaf -- unless it's
++actually the one invoked.
++
++Why this can't just be "check the 6-digit code in script"
++-----------------------------------------------------------
++A script interpreter checking a decimal OTP string is awkward and,
++worse, means the *code itself* -- not a signature over the spending
++transaction -- is the witness. That's replayable by anyone who
++observes it in the mempool before it's mined, and it doesn't bind the
++proof to a specific transaction the way a signature does.
++
++The fix used here is the same one TOTP-over-signatures schemes use:
++derive a fresh, unrelated-looking Schnorr keypair for every time step
++from an HMAC of the shared secret and the step counter, and let the
++leaf require a normal Schnorr signature from *that step's* key. Proving
++"I know the current code" and proving "I can sign with the current
++step's key" become the same statement, but the on-chain witness is a
++signature over the actual spending transaction, not a bare code.
++
++    privkey_t = HMAC-SHA256(secret, "HNS-TOTP-LEAF" || step_counter) mod n
++    pubkey_t  = privkey_t * G
++
++Each step's `pubkey_t` is baked into its own MAST leaf at tree-build
++time (see `TotpLeafSet`). At spend time the owner reveals only the one
++leaf whose step is current, exactly like revealing a timelock or
++multisig leaf -- the other, unused step-keys stay hidden inside the
++Merkle root along with every other condition that wasn't invoked.
++
++Two problems this does NOT solve on its own -- read before using
++------------------------------------------------------------------
++1. **Time synchronization.** The tree has to be built with a *window*
++   of steps around "now" (`TotpLeafSet.window`) because the signer's
++   clock, the node relaying the transaction, and block time itself are
++   never perfectly aligned. Too narrow a window and a legitimate spend
++   gets rejected for landing one step late; too wide a window and you've
++   quietly reintroduced a longer-lived secret-guessing surface. This
++   repo defaults to +/-1 step (i.e. valid for ~90 seconds at the default
++   30s step), matching typical TOTP client tolerance -- tune for your
++   actual expected clock drift and mempool/confirmation delay, not for
++   this default blindly.
++2. **Secret management.** `secret` here plays the same role as a TOTP
++   seed in any authenticator app: whoever holds it can derive every
++   past and future step key. It needs the same handling real TOTP
++   seeds need (secure enclave / HSM, never logged, rotated on suspected
++   compromise) *plus* the awareness that -- unlike a normal 2FA app
++   protecting a login -- compromise here is a compromise of a
++   name-ownership recovery path. Treat it as key material, not as a
++   convenience secret.
++
++Why ZK proofs are the "real" answer, and why covenants still work without them
++--------------------------------------------------------------------------------
++This scheme still reveals, at spend time, exactly *which* time-step
++leaf fired and the pubkey/signature for it -- an observer watching the
++mempool learns "this owner's TOTP path was used just now," even though
++they learn nothing about the secret itself or the other leaves. A zero-
++knowledge proof of "I know a secret and a step such that
++HMAC(secret, step) derives a key that signs this transaction, and step
++is within the current window" would hide even that: the witness would
++be a proof, not a distinguishable signature/pubkey pair, so a TOTP-
++gated spend would be indistinguishable from any other script-path (or
++even key-path) spend. That's a strictly stronger privacy and
++anti-replay property than the leaf-per-step approach here, at the cost
++of needing a circuit and a proving system HNS's script interpreter
++doesn't have today.
++
++None of that blocks using this pattern with covenants as they exist:
++the leaf-per-step construction above is pure Schnorr + MAST, wraps
++into `NameOutputSpec` exactly like the timelock/multisig leaves, and
++needs nothing from hsd that the rest of this repo doesn't already
++assume. ZK is the upgrade path if/when a proving system is available;
++it is not a precondition for shipping the simpler version.
++"""
++from __future__ import annotations
++
++import hashlib
++import hmac
++import struct
++import time
++from dataclasses import dataclass
++
++from . import secp256k1 as C
++from .schnorr import pubkey_from_privkey, sign, verify
++
++DEFAULT_STEP_SECONDS = 30
++DEFAULT_DIGITS = 6
++DEFAULT_WINDOW = 1
++
++LEAF_TAG = b"TOTP"
++
++
++def hotp_code(secret: bytes, counter: int, digits: int = DEFAULT_DIGITS) -> str:
++    """RFC 4226 HOTP value -- the human-facing code an authenticator app
++    would display for this counter. Not used on-chain; useful only for
++    cross-checking a step against a normal TOTP app during setup/testing."""
++    msg = struct.pack(">Q", counter)
++    digest = hmac.new(secret, msg, hashlib.sha1).digest()
++    offset = digest[-1] & 0x0F
++    code_int = int.from_bytes(digest[offset:offset + 4], "big") & 0x7FFFFFFF
++    return str(code_int % (10 ** digits)).zfill(digits)
++
++
++def totp_counter(step_seconds: int = DEFAULT_STEP_SECONDS, at: int | None = None) -> int:
++    t = int(time.time()) if at is None else at
++    return t // step_seconds
++
++
++def derive_step_privkey(secret: bytes, counter: int) -> bytes:
++    """The on-chain-relevant primitive: a deterministic, otherwise
++    unrelated-looking Schnorr private key for one TOTP time step."""
++    d = hmac.new(secret, LEAF_TAG + struct.pack(">Q", counter), hashlib.sha256).digest()
++    d_int = (C.int_from_bytes(d) % (C.N - 1)) + 1
++    return d_int.to_bytes(32, "big")
++
++
++def derive_step_pubkey(secret: bytes, counter: int) -> bytes:
++    return pubkey_from_privkey(derive_step_privkey(secret, counter))
++
++
++def totp_leaf_script(pubkey_x: bytes) -> bytes:
++    """Placeholder encoding for a script-path leaf that checks a Schnorr
++    signature against one time-step's pubkey. Format: b'TOTP' || x-only
++    pubkey (32 bytes). Swap for a real CHECKSIG-style opcode sequence to
++    deploy against an actual covenant output -- same caveat as the other
++    placeholder scripts in `hns_covenant.py`."""
++    if len(pubkey_x) != 32:
++        raise ValueError("pubkey_x must be 32 bytes")
++    return LEAF_TAG + pubkey_x
++
++
++@dataclass
++class TotpLeafSet:
++    """A window of TOTP leaves around 'now'. Building the tree with a
++    window (rather than a single current-step leaf) is what makes the
++    recovery path survive realistic clock drift between the signer's
++    device, the relaying node, and confirmation time -- see the module
++    docstring for the tradeoff this involves."""
++
++    secret: bytes
++    step_seconds: int = DEFAULT_STEP_SECONDS
++    window: int = DEFAULT_WINDOW
++
++    def counters(self, at: int | None = None) -> list[int]:
++        center = totp_counter(self.step_seconds, at=at)
++        return [center + i for i in range(-self.window, self.window + 1)]
++
++    def scripts(self, at: int | None = None) -> list[bytes]:
++        return [totp_leaf_script(derive_step_pubkey(self.secret, c)) for c in self.counters(at=at)]
++
++    def sign_for_now(self, msg_hash: bytes, at: int | None = None) -> tuple[int, bytes]:
++        """Sign with the current step's key -- the step an authenticator
++        app's live code corresponds to right now. Returns
++        `(counter, signature)`; the spender needs the counter to know
++        which leaf in the window to reveal via `mast.TapTree.control_path`."""
++        counter = totp_counter(self.step_seconds, at=at)
++        return counter, sign(msg_hash, derive_step_privkey(self.secret, counter))
++
++    def verify_for_counter(self, msg_hash: bytes, counter: int, sig: bytes) -> bool:
++        return verify(msg_hash, derive_step_pubkey(self.secret, counter), sig)
++
++    def leaf_index_for_counter(self, counter: int, at: int | None = None) -> int:
++        """Index of `counter`'s leaf within `self.scripts()`'s output,
++        for locating it in the built `TapTree`."""
++        counters = self.counters(at=at)
++        return counters.index(counter)
+diff --git a/test_mast.py b/tests/test_mast.py
+similarity index 100%
+rename from test_mast.py
+rename to tests/test_mast.py
+diff --git a/test_schnorr.py b/tests/test_schnorr.py
+similarity index 100%
+rename from test_schnorr.py
+rename to tests/test_schnorr.py
+diff --git a/test_taproot.py b/tests/test_taproot.py
+similarity index 100%
+rename from test_taproot.py
+rename to tests/test_taproot.py
+diff --git a/tests/test_totp.py b/tests/test_totp.py
+new file mode 100644
+index 0000000..f851274
+--- /dev/null
++++ b/tests/test_totp.py
+@@ -0,0 +1,134 @@
++import hashlib
++import sys
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
++
++from hns_taproot import schnorr
++from hns_taproot.totp import (
++    TotpLeafSet,
++    derive_step_privkey,
++    derive_step_pubkey,
++    hotp_code,
++    totp_counter,
++    totp_leaf_script,
++)
++from hns_taproot.hns_covenant import (
++    CovenantType,
++    NameOutputSpec,
++    RecoveryLeaf,
++    simple_timelock_script,
++    totp_recovery_leaves,
++)
++
++SECRET = b"test-shared-secret-do-not-use-in-prod"
++FIXED_NOW = 1_700_000_000  # arbitrary fixed unix time for reproducible tests
++
++
++def test_hotp_code_is_six_digits_and_deterministic():
++    code_a = hotp_code(SECRET, counter=42)
++    code_b = hotp_code(SECRET, counter=42)
++    assert code_a == code_b
++    assert len(code_a) == 6
++    assert code_a.isdigit()
++
++
++def test_hotp_code_changes_across_counters():
++    assert hotp_code(SECRET, counter=1) != hotp_code(SECRET, counter=2)
++
++
++def test_step_keypair_is_deterministic_and_valid():
++    counter = totp_counter(at=FIXED_NOW)
++    priv = derive_step_privkey(SECRET, counter)
++    pub = derive_step_pubkey(SECRET, counter)
++    assert schnorr.pubkey_from_privkey(priv) == pub
++
++    msg = hashlib.sha256(b"totp leaf spend").digest()
++    sig = schnorr.sign(msg, priv)
++    assert schnorr.verify(msg, pub, sig)
++
++
++def test_step_keys_differ_across_steps():
++    a = derive_step_pubkey(SECRET, counter=100)
++    b = derive_step_pubkey(SECRET, counter=101)
++    assert a != b
++
++
++def test_totp_leaf_script_round_trips_pubkey():
++    pub = derive_step_pubkey(SECRET, counter=5)
++    script = totp_leaf_script(pub)
++    assert script.startswith(b"TOTP")
++    assert script[4:] == pub
++
++
++def test_leaf_set_window_covers_expected_counters():
++    totp = TotpLeafSet(secret=SECRET, step_seconds=30, window=1)
++    counters = totp.counters(at=FIXED_NOW)
++    center = totp_counter(30, at=FIXED_NOW)
++    assert counters == [center - 1, center, center + 1]
++    assert len(totp.scripts(at=FIXED_NOW)) == 3
++
++
++def test_sign_for_now_verifies_against_current_step():
++    totp = TotpLeafSet(secret=SECRET, step_seconds=30, window=1)
++    msg = hashlib.sha256(b"spend at current step").digest()
++    counter, sig = totp.sign_for_now(msg, at=FIXED_NOW)
++    assert totp.verify_for_counter(msg, counter, sig)
++
++    # Signature for the current step must not verify against a neighbor.
++    assert not totp.verify_for_counter(msg, counter + 1, sig)
++
++
++def test_totp_recovery_leaves_matches_window_size():
++    totp = TotpLeafSet(secret=SECRET, step_seconds=30, window=2)
++    leaves = totp_recovery_leaves(totp, at=FIXED_NOW)
++    assert len(leaves) == 5  # window=2 -> 2*2+1 steps
++    assert all(leaf.script.startswith(b"TOTP") for leaf in leaves)
++    assert len({leaf.script for leaf in leaves}) == 5  # all distinct
++
++
++def test_name_output_spec_with_totp_leaf_alongside_recovery_leaves():
++    owner_priv = schnorr.generate_privkey()
++    totp = TotpLeafSet(secret=SECRET, step_seconds=30, window=1)
++
++    spec = NameOutputSpec(
++        name="example",
++        covenant=CovenantType.TRANSFER,
++        owner_privkey=owner_priv,
++        recovery_leaves=[
++            RecoveryLeaf(label="90-day timelock fallback", script=simple_timelock_script(12960)),
++        ],
++        totp=totp,
++        totp_at=FIXED_NOW,
++    )
++    out = spec.build()
++
++    assert out.has_recovery_paths()
++    # 1 timelock leaf + 3 totp-window leaves
++    assert len(out.tree.leaves) == 4
++
++    current_counter = totp_counter(30, at=FIXED_NOW)
++    idx = out.totp_leaf_index_for_counter(current_counter, at=FIXED_NOW)
++    # offset 1 (the preceding timelock leaf) + 1 (current step is the
++    # middle entry of the [-1, 0, +1] window) = 2
++    assert idx == 2
++
++    # The revealed leaf must actually be provable against the committed root.
++    path = out.tree.control_path(idx)
++    assert isinstance(path, list)
++
++
++def test_totp_only_output_has_no_static_recovery_leaves():
++    owner_priv = schnorr.generate_privkey()
++    totp = TotpLeafSet(secret=SECRET, step_seconds=30, window=1)
++
++    spec = NameOutputSpec(
++        name="example",
++        covenant=CovenantType.TRANSFER,
++        owner_privkey=owner_priv,
++        totp=totp,
++        totp_at=FIXED_NOW,
++    )
++    out = spec.build()
++    assert len(out.tree.leaves) == 3
++    assert out.totp_leaf_offset == 0
+-- 
+2.43.0
+
