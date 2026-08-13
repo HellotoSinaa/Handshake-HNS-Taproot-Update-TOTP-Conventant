@@ -1,0 +1,3 @@
+# The library itself has zero runtime dependencies (see src/hns_taproot/secp256k1.py).
+# These are only needed to run the test suite.
+pytest>=7.0
